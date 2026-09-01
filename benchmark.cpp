@@ -1,11 +1,15 @@
 #include <chrono>
+#include <cstddef>
 #include <fcntl.h>
+#include <immintrin.h>
 #include <iostream>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 int main(int argc, char *argv[]) {
+
+  int num_element = 100000000;
 
   int fd_1 = open("a.f32", O_RDONLY);
   int fd_2 = open("b.f32", O_RDONLY);
@@ -69,13 +73,15 @@ int main(int argc, char *argv[]) {
   std::cout << "b[0]: " << b[0] << "\n";
   std::cout << "b[1]: " << b[1] << "\n";
 
+  // scalar
+
   double accum = 0;
 
   // time harness
 
   const auto start_time = std::chrono::steady_clock::now();
 
-  for (int i = 0; i < 100000000; i++) {
+  for (int i = 0; i < num_element; i++) {
     float prod = a[i] * b[i];
     accum += prod;
   }
@@ -89,6 +95,35 @@ int main(int argc, char *argv[]) {
   double bandwidth = 0.8 / elapsed_seconds.count();
 
   std::cout << "bandwidth: " << bandwidth << "gb/s\n";
+
+  return 0;
+}
+
+float calculate_vector_dot_product(float *a, float *b, size_t num_element) {
+
+  __m256 ymm_1 = _mm256_setzero_ps();
+  __m256 ymm_2 = _mm256_setzero_ps();
+  __m256 ymm_3 = _mm256_setzero_ps();
+  __m256 ymm_4 = _mm256_setzero_ps();
+
+  for (size_t i = 0; i < num_element; i += 32) {
+    __m256 a1 = _mm256_loadu_ps(&a[i]);
+    __m256 a2 = _mm256_loadu_ps(&a[i + 8]);
+    __m256 a3 = _mm256_loadu_ps(&a[i + 16]);
+    __m256 a4 = _mm256_loadu_ps(&a[i + 24]);
+    __m256 a5 = _mm256_loadu_ps(&a[i + 32]);
+
+    __m256 b1 = _mm256_loadu_ps(&b[i]);
+    __m256 b2 = _mm256_loadu_ps(&b[i + 8]);
+    __m256 b3 = _mm256_loadu_ps(&b[i + 16]);
+    __m256 b4 = _mm256_loadu_ps(&b[i + 24]);
+    __m256 b5 = _mm256_loadu_ps(&b[i + 32]);
+
+    ymm_1 = _mm256_fmadd_ps(a1, b1, ymm_1);
+    ymm_2 = _mm256_fmadd_ps(a2, b2, ymm_2);
+    ymm_3 = _mm256_fmadd_ps(a2, b2, ymm_2);
+    ymm_4 = _mm256_fmadd_ps(a2, b2, ymm_2);
+  }
 
   return 0;
 }
