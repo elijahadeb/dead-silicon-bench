@@ -1,16 +1,21 @@
 #include <chrono>
 #include <cstddef>
 #include <fcntl.h>
+#include <future>
 #include <immintrin.h>
 #include <iomanip>
 #include <ios>
 #include <iostream>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 #include <xmmintrin.h>
 
-float calculate_vector_dot_product(float *a, float *b) {
+// single avx2
+
+double calculate_vector_dot_product(float *a, float *b) {
   double total = 0.0;
 
   const auto start_time = std::chrono::steady_clock::now();
@@ -68,6 +73,58 @@ float calculate_vector_dot_product(float *a, float *b) {
 
   return total;
 }
+
+// multithreaded avx2
+
+double threaded_avx2_fnct(float *a, float *b, size_t start_index,
+                          size_t end_index) {
+
+  __m256 ymm_1 = _mm256_setzero_ps();
+  __m256 ymm_2 = _mm256_setzero_ps();
+  __m256 ymm_3 = _mm256_setzero_ps();
+  __m256 ymm_4 = _mm256_setzero_ps();
+
+  for (size_t j = start_index; j + 32 <= end_index; j += 32) {
+    __m256 a1 = _mm256_loadu_ps(&a[j]);
+    __m256 a2 = _mm256_loadu_ps(&a[j + 8]);
+    __m256 a3 = _mm256_loadu_ps(&a[j + 16]);
+    __m256 a4 = _mm256_loadu_ps(&a[j + 24]);
+
+    __m256 b1 = _mm256_loadu_ps(&b[j]);
+    __m256 b2 = _mm256_loadu_ps(&b[j + 8]);
+    __m256 b3 = _mm256_loadu_ps(&b[j + 16]);
+    __m256 b4 = _mm256_loadu_ps(&b[j + 24]);
+
+    ymm_1 = _mm256_fmadd_ps(a1, b1, ymm_1);
+    ymm_2 = _mm256_fmadd_ps(a2, b2, ymm_2);
+    ymm_3 = _mm256_fmadd_ps(a3, b3, ymm_3);
+    ymm_4 = _mm256_fmadd_ps(a4, b4, ymm_4);
+  }
+
+  __m256 acc_ymm1_ymm2 = _mm256_add_ps(ymm_1, ymm_2);
+  __m256 acc_ymm3_ymm4 = _mm256_add_ps(ymm_3, ymm_4);
+  __m256 acc = _mm256_add_ps(acc_ymm1_ymm2, acc_ymm3_ymm4);
+
+  __m128 xmm_high = _mm256_extractf128_ps(acc, 1);
+  __m128 xmm_low = _mm256_castps256_ps128(acc);
+
+  __m128 xmm_sum = _mm_add_ps(xmm_low, xmm_high);
+
+  // one more fold.
+
+  __m128 upper_2 = _mm_movehl_ps(xmm_sum, xmm_sum);
+
+  xmm_sum = _mm_add_ps(upper_2, xmm_sum);
+  __m128 final_reduce = _mm_shuffle_ps(xmm_sum, xmm_sum, 1);
+  xmm_sum = _mm_add_ps(final_reduce, xmm_sum);
+
+  double scalar_conv = _mm_cvtss_f32(xmm_sum);
+
+  // scalar tail
+
+  return scalar_conv;
+}
+// mmap-binary file / scalar
 
 int main() {
 
@@ -151,7 +208,7 @@ int main() {
     std::cout << "";
   };
 
-  // time harness|
+  // time harness
 
   const auto start_time = std::chrono::steady_clock::now();
 
@@ -192,6 +249,28 @@ int main() {
             << (err_scalar < 1e-3 ? " -> passed" : " -> failed") << "\n";
   std::cout << "avx2 rel err: " << err_avx2
             << (err_avx2 < 1e-3 ? " -> passed" : " -> failed") << "\n";
+
+  int total_cores = std::thread::hardware_concurrency();
+  size_t c_size = (num_element / total_cores) & ~size_t(31);
+
+  std::vector<std::future<double>> futures;
+
+  for (size_t workers_id = 0; workers_id < total_cores; workers_id++) {
+    size_t start_index = workers_id * c_size;
+    size_t end_index = (workers_id == total_cores - 1) ? (size_t)num_element
+                                                       : start_index + c_size;
+
+    futures.push_back(std::async(std::launch::async, threaded_avx2_fnct, a, b,
+                                 start_index, end_index));
+  };
+
+  double total_result = 0.0;
+
+  for (auto &future : futures) {
+    total_result += future.get();
+  }
+
+  std::cout << "threaded_avx2: " << total_result << std::endl;
 
   return 0;
 }
