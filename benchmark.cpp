@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <fcntl.h>
 #include <future>
@@ -12,30 +13,48 @@
 #include <unistd.h>
 #include <vector>
 #include <xmmintrin.h>
+// horizontal_reduction
+static inline float hsum256_ps(__m256 acc) {
+  __m128 xmm_high = _mm256_extractf128_ps(acc, 1);
+  __m128 xmm_low = _mm256_castps256_ps128(acc);
+
+  __m128 xmm_sum = _mm_add_ps(xmm_low, xmm_high);
+
+  // one more fold.
+
+  __m128 upper_2 = _mm_movehl_ps(xmm_sum, xmm_sum);
+
+  xmm_sum = _mm_add_ps(upper_2, xmm_sum);
+  __m128 final_reduce = _mm_shuffle_ps(xmm_sum, xmm_sum, 1);
+  xmm_sum = _mm_add_ps(final_reduce, xmm_sum);
+
+  return _mm_cvtss_f32(xmm_sum);
+}
 
 // single avx2
 
-double calculate_vector_dot_product(float *a, float *b) {
+double calculate_vector_dot_product(float *a, float *b, size_t num_element) {
   double total = 0.0;
 
-  const auto start_time = std::chrono::steady_clock::now();
+  const size_t BLOCK = 100000; // must be a multiple of 32
+  size_t nblocks = num_element / BLOCK;
 
-  for (size_t c = 0; c < 1000; c++) {
+  for (size_t c = 0; c < nblocks; c++) {
     __m256 ymm_1 = _mm256_setzero_ps();
     __m256 ymm_2 = _mm256_setzero_ps();
     __m256 ymm_3 = _mm256_setzero_ps();
     __m256 ymm_4 = _mm256_setzero_ps();
 
-    for (size_t j = 0; j + 32 <= 100000; j += 32) {
-      __m256 a1 = _mm256_loadu_ps(&a[c * 100000 + j]);
-      __m256 a2 = _mm256_loadu_ps(&a[c * 100000 + j + 8]);
-      __m256 a3 = _mm256_loadu_ps(&a[c * 100000 + j + 16]);
-      __m256 a4 = _mm256_loadu_ps(&a[c * 100000 + j + 24]);
+    for (size_t j = 0; j + 32 <= BLOCK; j += 32) {
+      __m256 a1 = _mm256_loadu_ps(&a[c * BLOCK + j]);
+      __m256 a2 = _mm256_loadu_ps(&a[c * BLOCK + j + 8]);
+      __m256 a3 = _mm256_loadu_ps(&a[c * BLOCK + j + 16]);
+      __m256 a4 = _mm256_loadu_ps(&a[c * BLOCK + j + 24]);
 
-      __m256 b1 = _mm256_loadu_ps(&b[c * 100000 + j]);
-      __m256 b2 = _mm256_loadu_ps(&b[c * 100000 + j + 8]);
-      __m256 b3 = _mm256_loadu_ps(&b[c * 100000 + j + 16]);
-      __m256 b4 = _mm256_loadu_ps(&b[c * 100000 + j + 24]);
+      __m256 b1 = _mm256_loadu_ps(&b[c * BLOCK + j]);
+      __m256 b2 = _mm256_loadu_ps(&b[c * BLOCK + j + 8]);
+      __m256 b3 = _mm256_loadu_ps(&b[c * BLOCK + j + 16]);
+      __m256 b4 = _mm256_loadu_ps(&b[c * BLOCK + j + 24]);
 
       ymm_1 = _mm256_fmadd_ps(a1, b1, ymm_1);
       ymm_2 = _mm256_fmadd_ps(a2, b2, ymm_2);
@@ -47,29 +66,14 @@ double calculate_vector_dot_product(float *a, float *b) {
     __m256 acc_ymm3_ymm4 = _mm256_add_ps(ymm_3, ymm_4);
     __m256 acc = _mm256_add_ps(acc_ymm1_ymm2, acc_ymm3_ymm4);
 
-    __m128 xmm_high = _mm256_extractf128_ps(acc, 1);
-    __m128 xmm_low = _mm256_castps256_ps128(acc);
-
-    __m128 xmm_sum = _mm_add_ps(xmm_low, xmm_high);
-
-    // one more fold.
-
-    __m128 upper_2 = _mm_movehl_ps(xmm_sum, xmm_sum);
-
-    xmm_sum = _mm_add_ps(upper_2, xmm_sum);
-    __m128 final_reduce = _mm_shuffle_ps(xmm_sum, xmm_sum, 1);
-    xmm_sum = _mm_add_ps(final_reduce, xmm_sum);
-
-    float scalar_conv = _mm_cvtss_f32(xmm_sum);
-
-    total += scalar_conv;
+    total += hsum256_ps(acc);
   }
-  const auto end_time = std::chrono::steady_clock::now();
-  const std::chrono::duration<double> elapsed_seconds(end_time - start_time);
 
-  std::cout << elapsed_seconds.count() << "s\n";
-  double bandwidth = 0.8 / elapsed_seconds.count();
-  std::cout << "avx2 bandwidth: " << bandwidth << "gb/s\n";
+  // scalar tail
+
+  for (size_t i = BLOCK * nblocks; i < num_element; i++) {
+    total += (double)a[i] * (double)b[i];
+  }
 
   return total;
 }
@@ -115,22 +119,7 @@ double threaded_avx2_fnct(float *a, float *b, size_t start_index,
     __m256 acc_ymm3_ymm4 = _mm256_add_ps(ymm_3, ymm_4);
     __m256 acc = _mm256_add_ps(acc_ymm1_ymm2, acc_ymm3_ymm4);
 
-    __m128 xmm_high = _mm256_extractf128_ps(acc, 1);
-    __m128 xmm_low = _mm256_castps256_ps128(acc);
-
-    __m128 xmm_sum = _mm_add_ps(xmm_low, xmm_high);
-
-    // one more fold.
-
-    __m128 upper_2 = _mm_movehl_ps(xmm_sum, xmm_sum);
-
-    xmm_sum = _mm_add_ps(upper_2, xmm_sum);
-    __m128 final_reduce = _mm_shuffle_ps(xmm_sum, xmm_sum, 1);
-    xmm_sum = _mm_add_ps(final_reduce, xmm_sum);
-
-    double scalar_conv = _mm_cvtss_f32(xmm_sum);
-
-    total += scalar_conv;
+    total += hsum256_ps(acc);
   }
 
   // scalar tail
@@ -147,74 +136,83 @@ int main() {
 
   std::cout << std::scientific << std::setprecision(15);
 
-  int num_element = 100000000;
+  size_t num_element = 100000000;
 
   int fd_1 = open("a.f32", O_RDONLY);
   int fd_2 = open("b.f32", O_RDONLY);
 
   if (fd_1 == -1) {
-    std::cout << "failed to open file: a.f32" << std::endl;
-    close(fd_1);
+    std::cerr << "failed to open file: a.f32" << std::endl;
+    close(fd_2);
     return 1;
   }
 
   if (fd_2 == -1) {
-    std::cout << "failed to open file: b.f32" << std::endl;
-    close(fd_2);
+    std::cerr << "failed to open file: b.f32" << std::endl;
+    close(fd_1);
     return 1;
   }
 
   struct stat file_info_a;
   struct stat file_info_b;
 
-  size_t size_a = fstat(fd_1, &file_info_a);
-  size_t size_b = fstat(fd_2, &file_info_b);
+  if (fstat(fd_1, &file_info_a) == -1) {
+    std::cerr << "failed to get a.f32 file stat";
+    close(fd_1);
+    close(fd_2);
+
+    return 1;
+  }
+  if (fstat(fd_2, &file_info_b) == -1) {
+    std::cerr << "failed to get b.f32 file stat";
+    close(fd_1);
+    close(fd_2);
+    return 1;
+  }
 
   size_t file_size_a = file_info_a.st_size;
   size_t file_size_b = file_info_b.st_size;
 
-  if (file_size_a == -1) {
-    std::cout << "failed to fetch size a" << std::endl;
+  if (file_size_a != num_element * sizeof(float)) {
+    std::cerr << "a.f32 is " << file_size_a
+              << " what is expected: " << num_element * sizeof(float) << "\n";
     close(fd_1);
-    return 1;
-  } else {
-    std::cout << file_size_a << "\n";
-  }
-
-  if (file_size_b == -1) {
-    std::cout << "failed to fetch size" << std::endl;
     close(fd_2);
     return 1;
-  } else {
-    std::cout << file_size_b << "\n";
   }
+
+  if (file_size_b != num_element * sizeof(float)) {
+    std::cerr << "b.f32 is " << file_size_b
+              << " what is expected: " << num_element * sizeof(float) << "\n";
+    close(fd_1);
+    close(fd_2);
+    return 1;
+  }
+
   void *mapped_a = mmap(NULL, file_size_a, PROT_READ, MAP_PRIVATE, fd_1, 0);
-  void *mapped_b = mmap(NULL, file_size_b, PROT_READ, MAP_PRIVATE, fd_2, 0);
 
   if (mapped_a == MAP_FAILED) {
-    std::cout << "mmap a failed" << std::endl;
+    std::cerr << "mmap a failed" << std::endl;
     close(fd_1);
+    close(fd_2);
     return 1;
   }
 
+  void *mapped_b = mmap(NULL, file_size_b, PROT_READ, MAP_PRIVATE, fd_2, 0);
+
   if (mapped_b == MAP_FAILED) {
-    std::cout << "mmap b failed" << std::endl;
+    std::cerr << "mmap b failed" << std::endl;
+    close(fd_1);
     close(fd_2);
+
+    munmap(mapped_a, file_size_a);
     return 1;
   }
 
   float *a = static_cast<float *>(mapped_a);
   float *b = static_cast<float *>(mapped_b);
 
-  std::cout << "a[0]: " << a[0] << "\n";
-  std::cout << "a[1]: " << a[1] << "\n";
-  std::cout << "b[0]: " << b[0] << "\n";
-  std::cout << "b[1]: " << b[1] << "\n";
-
-  // scalar
-
-  double accum = 0.0;
-
+  // scalar - warm loop
   float warm = 0.0f;
 
   for (size_t i = 0; i < num_element; i += 32) {
@@ -223,7 +221,9 @@ int main() {
 
   if (warm == 1234.0f) {
     std::cout << "";
-  };
+  }
+
+  double accum = 0.0;
 
   // time harness
 
@@ -237,12 +237,13 @@ int main() {
   const auto end_time = std::chrono::steady_clock::now();
   const std::chrono::duration<double> elapsed_seconds(end_time - start_time);
 
-  std::cout << "scalar dot product: " << accum << std::endl;
+  std::cout << "scalarf32 result: " << accum << std::endl;
   std::cout << elapsed_seconds.count() << "s\n";
 
-  double bandwidth = 0.8 / elapsed_seconds.count();
+  double bytes = 2.0 * num_element * sizeof(float);
+  double bandwidth = bytes / 1e9 / elapsed_seconds.count();
 
-  std::cout << "scalar_bandwidth: " << bandwidth << "gb/s\n";
+  std::cout << "scalarf32_bandwidth: " << bandwidth << "gb/s\n";
 
   // float64 reference
 
@@ -255,7 +256,16 @@ int main() {
 
   std::cout << "scalar reference dot product: " << reference_accum << std::endl;
 
-  double avx2_result = calculate_vector_dot_product(a, b);
+  const auto start_time_avx2_single = std::chrono::steady_clock::now();
+  double avx2_result = calculate_vector_dot_product(a, b, num_element);
+  const auto end_time_avx2_single = std::chrono::steady_clock::now();
+  const std::chrono::duration<double> elapsed_seconds_avx2_single(
+      end_time_avx2_single - start_time_avx2_single);
+
+  std::cout << elapsed_seconds_avx2_single.count() << "s\n";
+  double bandwidth_avx2_single =
+      bytes / 1e9 / elapsed_seconds_avx2_single.count();
+  std::cout << "avx2 bandwidth: " << bandwidth_avx2_single << "gb/s\n";
 
   std::cout << "avx2: " << avx2_result << std::endl;
 
@@ -267,21 +277,31 @@ int main() {
   std::cout << "avx2 rel err: " << err_avx2
             << (err_avx2 < 1e-3 ? " -> passed" : " -> failed") << "\n";
 
-  const auto start_t = std::chrono::steady_clock::now();
+  size_t total_cores = std::thread::hardware_concurrency();
 
-  int total_cores = std::thread::hardware_concurrency();
+  if (total_cores == 0) {
+    std::cerr << "warning: hardware_concurrency() returned 0, falling back to "
+                 "1 core, single thread avx2"
+              << "\n";
+
+    total_cores = 1;
+  }
+
+  std::cout << "hardware_concurrency: " << total_cores << "\n";
+
   size_t c_size = (num_element / total_cores) & ~size_t(31);
 
   std::vector<std::future<double>> futures;
 
+  const auto start_t = std::chrono::steady_clock::now();
   for (size_t workers_id = 0; workers_id < total_cores; workers_id++) {
     size_t start_index = workers_id * c_size;
-    size_t end_index = (workers_id == total_cores - 1) ? (size_t)num_element
-                                                       : start_index + c_size;
+    size_t end_index =
+        (workers_id == total_cores - 1) ? num_element : start_index + c_size;
 
     futures.push_back(std::async(std::launch::async, threaded_avx2_fnct, a, b,
                                  start_index, end_index));
-  };
+  }
 
   double total_result = 0.0;
 
@@ -292,10 +312,9 @@ int main() {
   const std::chrono::duration<double> elapsed_s(end_t - start_t);
 
   std::cout << elapsed_s.count() << "s\n";
+  double threaded_bandw = bytes / 1e9 / elapsed_s.count();
 
-  double bandw = 0.8 / elapsed_s.count();
-
-  std::cout << "threaded_avx2_bandwidth: " << bandw << "gb/s\n";
+  std::cout << "threaded_avx2_bandwidth: " << threaded_bandw << "gb/s\n";
 
   std::cout << "threaded_avx2: " << total_result << std::endl;
 
@@ -305,5 +324,9 @@ int main() {
   std::cout << "threaded_avx2 rel err: " << err_threaded_avx2
             << (err_threaded_avx2 < 1e-3 ? " -> passed" : " -> failed") << "\n";
 
+  munmap(mapped_a, file_size_a);
+  munmap(mapped_b, file_size_b);
+  close(fd_1);
+  close(fd_2);
   return 0;
 }
